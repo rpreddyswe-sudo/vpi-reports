@@ -1,5 +1,5 @@
 """
-CSV Handler for VPI DL Monthly Report
+CSV Handler for VPI UL Monthly Report
 Handles CSV data loading, processing, and query simulation
 """
 
@@ -23,14 +23,14 @@ def load_csv_data(data_dir):
     if os.path.exists(data_dir):
         all_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
         
-        # Find DL-specific stage file (vpi_data_n5l_waiv_stage without ul)
-        stage_files = [f for f in all_files if 'vpi_data_n5l_waiv_stage' in f and 'ul' not in f]
+        # Find UL-specific stage file (vpi_data_n5l_waiv_stage_ul)
+        stage_files = [f for f in all_files if 'vpi_data_n5l_waiv_stage_ul' in f]
         if stage_files:
             csv_files['stage'] = os.path.join(data_dir, max(stage_files))
             print(f"  Stage file: {csv_files['stage']}")
         
-        # Find DL-specific ref file (vpi_data_n5l without ul)
-        ref_files = [f for f in all_files if 'vpi_data_n5l' in f and 'waiv_stage' not in f and 'ul' not in f]
+        # Find UL-specific ref file (vpi_data_n5l_ul)
+        ref_files = [f for f in all_files if 'vpi_data_n5l_ul' in f and 'waiv_stage' not in f]
         if ref_files:
             csv_files['ref'] = os.path.join(data_dir, max(ref_files))
             print(f"  Ref file: {csv_files['ref']}")
@@ -142,11 +142,11 @@ def update_params_for_csv_mode(query_key, original_params, curr, m1, m2):
     """Update query parameters to use detected CSV dates instead of hardcoded dates"""
     # Map of parameter positions to date variables for each query
     param_mappings = {
-        'avail': [m2, m2],  # DL uses >= M2 for both stage and ref
+        'avail': [curr, m1, m2],  # CURR for stage, M1 and M2 for ref
         'market': [curr, m1, m2],  # CURR, M1, M2
         'bandvend': [m1, curr],  # M1, CURR
         'bss_curr': [m1, curr],  # M1, CURR
-        'movement': [m1, curr],  # M1 for ref (lost), CURR for stage (new)
+        'movement': [m1, curr, curr, m1],  # M1 for ref (lost), CURR for stage (new), CURR for stage (new), M1 for ref (lost)
         'trgdist': [curr],  # CURR
         'cec': [curr, m1],  # CURR, M1
         'lost_by_band': [curr, m1, m1, curr],  # CURR, M1, M1, CURR
@@ -197,41 +197,28 @@ def execute_csv_query_logic(query_key, params, data, stage_table, ref_table, trg
     
     if query_key == 'avail':
         result = []
-        # Stage table availability - DL uses >= M2
+        # Stage table availability - exact match for CURR
         if 'stage' in data:
-            stage_data = data['stage']
-            month_counts = defaultdict(lambda: {'rows': 0, 'carriers': set()})
-            for row in stage_data:
-                month = row.get('cptmonth', '')[:10]
-                if month >= params[0]:  # M2 or later
-                    month_counts[month]['rows'] += 1
-                    month_counts[month]['carriers'].add(row.get('agg_unique_id', ''))
-            
-            for month in sorted(month_counts.keys()):
+            stage_data = filter_by_month(data['stage'], params[0])  # CURR
+            if stage_data:
                 result.append({
                     'tbl': stage_table,
-                    'cptmonth': month,
-                    'rows': month_counts[month]['rows'],
-                    'carriers': len(month_counts[month]['carriers'])
+                    'cptmonth': params[0],
+                    'rows': len(stage_data),
+                    'carriers': len(set(row.get('agg_unique_id', '') for row in stage_data))
                 })
         
-        # Ref table availability - DL uses >= M2
+        # Ref table availability - exact match for M1 and M2
         if 'ref' in data:
-            ref_data = data['ref']
-            month_counts = defaultdict(lambda: {'rows': 0, 'carriers': set()})
-            for row in ref_data:
-                month = row.get('cptmonth', '')[:10]
-                if month >= params[1]:  # M2 or later
-                    month_counts[month]['rows'] += 1
-                    month_counts[month]['carriers'].add(row.get('agg_unique_id', ''))
-            
-            for month in sorted(month_counts.keys()):
-                result.append({
-                    'tbl': ref_table,
-                    'cptmonth': month,
-                    'rows': month_counts[month]['rows'],
-                    'carriers': len(month_counts[month]['carriers'])
-                })
+            for month_param in [params[1], params[2]]:  # M1, M2
+                ref_data = filter_by_month(data['ref'], month_param)
+                if ref_data:
+                    result.append({
+                        'tbl': ref_table,
+                        'cptmonth': month_param,
+                        'rows': len(ref_data),
+                        'carriers': len(set(row.get('agg_unique_id', '') for row in ref_data))
+                    })
         
         return sorted(result, key=lambda x: (x['tbl'], x['cptmonth']))
     
@@ -283,11 +270,8 @@ def execute_csv_query_logic(query_key, params, data, stage_table, ref_table, trg
         if 'stage' not in data or 'ref' not in data:
             return []
         
-        # DL movement query uses: (M1, CURR, CURR, M1)
-        # Lost: REF where cptmonth=M1 not in STAGE where cptmonth=CURR
-        # New: STAGE where cptmonth=CURR not in REF where cptmonth=M1
-        ref_data = filter_by_month(data['ref'], params[0])  # M1 (params[0])
         stage_data = filter_by_month(data['stage'], params[1])  # CURR (params[1])
+        ref_data = filter_by_month(data['ref'], params[0])  # M1 (params[0])
         
         stage_ids = set(row.get('agg_unique_id', '') for row in stage_data)
         ref_ids = set(row.get('agg_unique_id', '') for row in ref_data)

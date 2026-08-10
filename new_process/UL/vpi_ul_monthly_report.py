@@ -9,25 +9,42 @@ Output:
 
 import sys
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
+
+# Import from UL-specific modules
+from utils import add_months
+from csv_handler import load_csv_data, detect_csv_dates, execute_query_on_csv
+from report_renderer import *
+from data_processor import market_movers_html, bandvend_flags, bss_flags_count, market_band_flags_count
 
 # ─── Config ────────────────────────────────────────────────────────────────
+# Environment mode: 'csv' for development (local files), 'db' for production (PostgreSQL)
+DATA_MODE = os.environ.get('DATA_MODE', 'csv').lower()  # Default to CSV for development
+
+# Conditional imports based on data mode
+if DATA_MODE == 'db':
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+# Database configuration (for production/UAT)
 CONN  = "postgresql://npanalytics_ro:verizon24@nts-gydv-fuze-planning-prd-01-cluster.cluster-cl9vgbtolm5s.us-east-1.rds.amazonaws.com:5432/fuzenppprod"
 STAGE = "vpi.vpi_data_n5l_waiv_stage_ul"
 REF   = "vpi.vpi_data_n5l_ul"
+TRGPRJD_UL = "trgprjd_ul"
+TRGCURR_UL = "trgcurr_ul"
+
+# CSV data directory (for development)
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 
 # ─── Date Setup ────────────────────────────────────────────────────────────
 if len(sys.argv) > 1:
     snapshot_date = sys.argv[1]
 else:
-    snapshot_date = (datetime.today().replace(day=1) - relativedelta(months=1)).strftime('%Y-%m-%d')
+    snapshot_date = add_months(datetime.today().replace(day=1), -1).strftime('%Y-%m-%d')
 
 curr_dt = datetime.strptime(snapshot_date, '%Y-%m-%d')
-m1_dt   = curr_dt - relativedelta(months=1)
-m2_dt   = curr_dt - relativedelta(months=2)
+m1_dt   = add_months(curr_dt, -1)
+m2_dt   = add_months(curr_dt, -2)
 
 CURR = curr_dt.strftime('%Y-%m-%d')
 M1   = m1_dt.strftime('%Y-%m-%d')
@@ -41,6 +58,7 @@ today_str = datetime.today().strftime('%Y-%m-%d')
 out_file  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          f"vpi_ul_report_{curr_dt.strftime('%b_%Y')}.html")
 
+print(f"Data Mode: {DATA_MODE.upper()}")
 print(f"Snapshot : {CURR}  |  Ref M-1 : {M1}  |  Ref M-2 : {M2}")
 print(f"Output   : {out_file}\n")
 
@@ -79,14 +97,14 @@ WITH prev AS (
    SELECT projecteddate, bandgrp, vendor,
           COUNT(DISTINCT agg_unique_id) AS cnt
    FROM {REF}
-   WHERE cptmonth=%s AND trgprjd_ul='y' AND projecteddate BETWEEN 2026 AND 2030
+   WHERE cptmonth=%s AND {TRGPRJD_UL}='y' AND projecteddate BETWEEN 2026 AND 2030
    GROUP BY 1,2,3
 ),
 curr AS (
    SELECT projecteddate, bandgrp, vendor,
           COUNT(DISTINCT agg_unique_id) AS cnt
    FROM {STAGE}
-   WHERE cptmonth=%s AND trgprjd_ul='y' AND projecteddate BETWEEN 2026 AND 2030
+   WHERE cptmonth=%s AND {TRGPRJD_UL}='y' AND projecteddate BETWEEN 2026 AND 2030
    GROUP BY 1,2,3
 )
 SELECT a.projecteddate, a.bandgrp, a.vendor,
@@ -137,7 +155,7 @@ FROM {STAGE} s WHERE s.cptmonth=%s
 
 "trgdist": (f"""
 SELECT projecteddate,
-       COALESCE(trgprjd_ul,'null') AS flag,
+       COALESCE({TRGPRJD_UL},'null') AS flag,
        COUNT(DISTINCT agg_unique_id) AS carriers
 FROM {STAGE} WHERE cptmonth=%s
 GROUP BY 1,2 ORDER BY 1,2
@@ -200,63 +218,110 @@ SELECT COUNT(*) AS total_rows,
        SUM(CASE WHEN bandgrp     IS NULL THEN 1 ELSE 0 END) AS null_bandgrp,
        SUM(CASE WHEN vendor      IS NULL THEN 1 ELSE 0 END) AS null_vendor,
        SUM(CASE WHEN projecteddate IS NULL THEN 1 ELSE 0 END) AS null_projdate,
-       SUM(CASE WHEN trgprjd_ul  IS NULL THEN 1 ELSE 0 END) AS null_trgprjd,
+       SUM(CASE WHEN {TRGPRJD_UL}   IS NULL THEN 1 ELSE 0 END) AS null_trgprjd,
        SUM(CASE WHEN cec_curr    IS NULL THEN 1 ELSE 0 END) AS null_cec_curr,
        SUM(CASE WHEN cec_prjd    IS NULL THEN 1 ELSE 0 END) AS null_cec_prjd
 FROM {STAGE} WHERE cptmonth=%s
 """, (CURR,)),
 
+"market_band_carrier_change": (f"""
+WITH prev AS (
+   SELECT market, bandgrp, COUNT(DISTINCT agg_unique_id) AS cnt
+   FROM {REF} WHERE cptmonth=%s GROUP BY 1,2
+),
+curr AS (
+   SELECT market, bandgrp, COUNT(DISTINCT agg_unique_id) AS cnt
+   FROM {STAGE} WHERE cptmonth=%s GROUP BY 1,2
+)
+SELECT COALESCE(a.market, b.market) AS market,
+       COALESCE(a.bandgrp, b.bandgrp) AS bandgrp,
+       a.cnt AS prev_count,
+       COALESCE(b.cnt,0) AS curr_count,
+       CASE WHEN a.cnt=0 THEN NULL
+            ELSE ROUND((((COALESCE(b.cnt,0)-a.cnt)::float/a.cnt)*100)::numeric,2)
+       END AS pct_diff,
+       CASE WHEN a.cnt>0 AND ((COALESCE(b.cnt,0)-a.cnt)::decimal/a.cnt)<-0.05
+            THEN 'Decrease >5%%' ELSE 'Acceptable' END AS flag
+FROM prev a
+FULL OUTER JOIN curr b ON a.market=b.market AND a.bandgrp=b.bandgrp
+ORDER BY 1,2
+""", (M1, CURR)),
+
+"trgcurr_market_band": (f"""
+SELECT market,
+       bandgrp,
+       COALESCE({TRGCURR_UL},'null') AS trgcurr_flag,
+       COUNT(DISTINCT agg_unique_id) AS carriers
+FROM {STAGE} WHERE cptmonth=%s
+GROUP BY 1,2,3 ORDER BY 1,2,4 DESC
+""", (CURR,)),
+
 }
 
 # ─── Run Queries ───────────────────────────────────────────────────────────
+# Total queries: 11 (added 2 new queries for market/band analysis)
 results = {}
-conn = psycopg2.connect(CONN)
-cur  = conn.cursor(cursor_factory=RealDictCursor)
 
-for key, (sql, params) in QUERIES.items():
-    try:
-        cur.execute(sql, params)
-        results[key] = [dict(r) for r in cur.fetchall()]
-        print(f"  [ok] {key} — {len(results[key])} rows")
-    except Exception as e:
-        print(f"  [ERR] {key}: {e}")
-        results[key] = []
-        conn.rollback()
-
-cur.close()
-conn.close()
-print()
-
-# ─── Helpers ───────────────────────────────────────────────────────────────
-def fmt(n):
-    if n is None: return '—'
-    try:    return f"{int(n):,}"
-    except: return str(n)
-
-def pct_class(v):
-    if v is None: return ''
-    try:
-        f = float(v)
-        if f <= -10:  return 'text-red'
-        if f <= -5:   return 'text-orange'
-        if f >= 10:   return 'text-green'
-        if f >= 5:    return 'text-green'
-        return ''
-    except: return ''
-
-def delta_class(v):
-    try:
-        return 'text-green' if float(v) >= 0 else 'text-red'
-    except: return ''
-
-def flag_html(flag):
-    if flag and 'Decrease' in str(flag):
-        return '<span class="flag-bad">&#x26A0; Decrease &gt;5%%</span>'
-    return '<span class="flag-ok">&#10003; Acceptable</span>'
-
-def kpi_delta_class(v):
-    try: return 'up' if float(v) >= 0 else 'down'
-    except: return 'neutral'
+if DATA_MODE == 'csv':
+    # Development mode: Use CSV files
+    csv_files = load_csv_data(DATA_DIR)
+    detected_curr, detected_m1, detected_m2 = detect_csv_dates(csv_files, STAGE, REF)
+    
+    # Only use detected dates if no specific snapshot date was provided
+    # If user provided a specific date, try to use that instead
+    if len(sys.argv) <= 1 and detected_curr:
+        # No command-line date provided, use detected dates from CSV
+        CURR = detected_curr
+        M1 = detected_m1 if detected_m1 else M1
+        M2 = detected_m2 if detected_m2 else M2
+        
+        # Update datetime objects and labels
+        curr_dt = datetime.strptime(CURR, '%Y-%m-%d')
+        m1_dt = datetime.strptime(M1, '%Y-%m-%d')
+        m2_dt = datetime.strptime(M2, '%Y-%m-%d')
+        h0 = curr_dt.strftime('%b %Y')
+        h1 = m1_dt.strftime('%b %Y')
+        
+        # Update output filename
+        out_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             f"vpi_ul_report_{curr_dt.strftime('%b_%Y')}.html")
+        print(f"Using detected dates from CSV files: {CURR} (current), {M1} (M-1), {M2} (M-2)")
+    else:
+        # User provided specific date or detection failed, use that date
+        # but warn if CSV files don't contain the requested date
+        if detected_curr and detected_curr != CURR:
+            print(f"Warning: CSV files contain {detected_curr}, but analyzing {CURR} as requested")
+        print(f"Using requested date: {CURR} (current), {M1} (M-1), {M2} (M-2)")
+    
+    print()
+    
+    for key, (sql, params) in QUERIES.items():
+        # Update params with detected dates for CSV mode
+        from csv_handler import update_params_for_csv_mode
+        updated_params = update_params_for_csv_mode(key, params, CURR, M1, M2)
+        results[key] = execute_query_on_csv(key, updated_params, csv_files, STAGE, REF, TRGPRJD_UL, TRGCURR_UL, h0, h1)
+    
+    print()
+    
+else:
+    # Production mode: Use PostgreSQL database
+    print("Connecting to PostgreSQL database...")
+    conn = psycopg2.connect(CONN)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    
+    for key, (sql, params) in QUERIES.items():
+        try:
+            cur.execute(sql, params)
+            results[key] = [dict(r) for r in cur.fetchall()]
+            print(f"  [ok] {key} — {len(results[key])} rows")
+        except Exception as e:
+            print(f"  [ERR] {key}: {e}")
+            results[key] = []
+            conn.rollback()
+    
+    cur.close()
+    conn.close()
+    print()
 
 # ─── Derived KPIs ──────────────────────────────────────────────────────────
 avail = results.get('avail', [])
@@ -318,42 +383,7 @@ def render_market_table():
     html += '</tbody></table></div>'
     return html
 
-def market_movers_html():
-    rows       = results.get('market', [])
-    rehome_src = {int(r['old_market']): int(r['new_market']) for r in results.get('rehome', []) if r.get('old_market') is not None and r.get('new_market') is not None}
-    rehome_dst = {v: k for k, v in rehome_src.items()}   # new_market -> old_market
 
-    big_drop = [(r['market'], r['var_curr_m1'], r['curr_cnt'], r['m1_cnt'])
-                for r in rows if r.get('var_curr_m1') is not None and float(r['var_curr_m1']) <= -10]
-    big_gain = [(r['market'], r['var_curr_m1'], r['curr_cnt'], r['m1_cnt'])
-                for r in rows if r.get('var_curr_m1') is not None and float(r['var_curr_m1']) >= 10]
-    big_drop.sort(key=lambda x: float(x[1]))
-    big_gain.sort(key=lambda x: -float(x[1]))
-
-    rehome_drop_html    = ''
-    unexplained_drop_html = ''
-    for m, v, c, m1 in big_drop:
-        mkt = int(m)
-        if mkt in rehome_src:
-            dest = rehome_src[mkt]
-            rehome_drop_html += (
-                f'<li>Mkt {m} &#8594; Mkt {dest} (rehome): '
-                f'<span class="text-red">{v}%%</span> ({fmt(m1)} &#8594; {fmt(c)})</li>'
-            )
-        else:
-            unexplained_drop_html += (
-                f'<li>Mkt {m}: <span class="text-red">{v}%%</span> '
-                f'({fmt(m1)} &#8594; {fmt(c)}) — <b>investigate</b></li>'
-            )
-
-    gain_html = ''.join(
-        f'<li>Mkt {m}'
-        f'{"  &#8592; rehome from Mkt " + str(rehome_dst[int(m)]) if int(m) in rehome_dst else ""}'
-        f': <span class="text-green">+{v}%%</span> ({fmt(m1)} &#8594; {fmt(c)})</li>'
-        for m, v, c, m1 in big_gain
-    ) or '<li>None</li>'
-
-    return rehome_drop_html, unexplained_drop_html, gain_html, len(big_drop), len(big_gain)
 
 def render_bandvend_table():
     rows = results.get('bandvend', [])
@@ -408,10 +438,9 @@ def render_trgdist_table():
         tot   = totals.get(yr, 1)
         pct   = round(int(r['carriers'] or 0) / tot * 100, 1) if tot else 0
         flagv = str(r['flag'])
-        fcls  = 'text-green' if flagv == 'y' else ('text-muted' if flagv == 'n' else '')
         html += f'<tr><td>{yr}</td>'
         html += f'<td style="font-weight:{"600" if flagv=="y" else "normal"};color:{"var(--green)" if flagv=="y" else "inherit"}">{flagv}</td>'
-        html += f'<td class="num {fcls}">{fmt(r["carriers"])}</td>'
+        html += f'<td class="num {"text-green" if flagv=="y" else ""}">{fmt(r["carriers"])}</td>'
         html += f'<td class="num text-muted">{pct}%%</td></tr>'
     html += '</tbody></table></div>'
     return html
@@ -419,7 +448,7 @@ def render_trgdist_table():
 def render_cec_table():
     rows = results.get('cec', [])
     html = '<div class="tbl-wrap"><table><thead><tr>'
-    html += f'<th>cec_curr</th><th>{h1} Count</th><th>{h0} Count</th><th>Delta</th>'
+    html += f'<th>cec_curr</th><th>{h1} (Ref)</th><th>{h0} (Stage)</th><th>Delta</th>'
     html += '</tr></thead><tbody>'
     total_m1 = total_curr = total_delta = 0
     for r in rows:
@@ -445,22 +474,24 @@ def render_lost_by_band_table():
     rows  = results.get('lost_by_band', [])
     total = sum(int(r['lost_carriers']) for r in rows)
     html  = '<div class="tbl-wrap"><table><thead><tr>'
-    html += f'<th>BandGrp</th><th>Lost Carriers ({h1} not in {h0})</th><th>% of Total</th><th>Visual</th>'
+    html += f'<th>BandGrp</th><th>Lost Carriers ({h1} not in {h0})</th><th>%% of Total</th><th>Visual</th>'
     html += '</tr></thead><tbody>'
+    top_band = rows[0]['bandgrp'] if rows else None
     for r in rows:
         cnt  = int(r['lost_carriers'])
         pct  = round(cnt / total * 100, 1) if total else 0
         bar  = int(pct)
-        bcls = 'text-red' if r['bandgrp'] == 'MMW' else ''
-        bold = 'font-weight:600;' if r['bandgrp'] == 'MMW' else ''
-        html += f'<tr style="{bold}background:{"rgba(248,113,113,0.07)" if r["bandgrp"]=="MMW" else "inherit"}">'
+        is_top = r['bandgrp'] == top_band
+        bcls = 'text-red' if is_top else ''
+        bold = 'font-weight:600;' if is_top else ''
+        html += f'<tr style="{bold}background:{"rgba(248,113,113,0.07)" if is_top else "inherit"}">'
         html += f'<td>{r["bandgrp"]}</td>'
         html += f'<td class="num {bcls}">{cnt:,}</td>'
-        html += f'<td class="num {bcls}">{pct}%</td>'
-        html += f'<td><div style="background:{"var(--red)" if r["bandgrp"]=="MMW" else "var(--accent)"};height:10px;width:{bar}%;border-radius:3px;min-width:2px"></div></td>'
+        html += f'<td class="num {bcls}">{pct}%%</td>'
+        html += f'<td><div style="background:{"var(--red)" if is_top else "var(--accent)"};height:10px;width:{bar}%%;border-radius:3px;min-width:2px"></div></td>'
         html += '</tr>'
     html += f'<tr style="font-weight:600;border-top:2px solid var(--border)">'
-    html += f'<td>TOTAL</td><td class="num">{total:,}</td><td class="num">100.0%</td><td></td></tr>'
+    html += f'<td>TOTAL</td><td class="num">{total:,}</td><td class="num">100.0%%</td><td></td></tr>'
     html += '</tbody></table></div>'
     return html
 
@@ -474,7 +505,7 @@ def render_dq_table():
         ('Null bandgrp',            fmt(r.get('null_bandgrp')),      r.get('null_bandgrp')),
         ('Null vendor',             fmt(r.get('null_vendor')),       r.get('null_vendor')),
         ('Null projecteddate',      fmt(r.get('null_projdate')),     r.get('null_projdate')),
-        ('Null trgprjd_ul',         fmt(r.get('null_trgprjd')),      r.get('null_trgprjd')),
+        (f'Null {TRGPRJD_UL}',      fmt(r.get('null_trgprjd')),      r.get('null_trgprjd')),
         ('Null cec_curr',           fmt(r.get('null_cec_curr')),     r.get('null_cec_curr')),
         ('Null cec_prjd',           fmt(r.get('null_cec_prjd')),     None),  # expected null
     ]
@@ -492,33 +523,85 @@ def render_dq_table():
     html += '</tbody></table></div>'
     return html
 
-def bss_flags_count():
-    return sum(1 for r in results.get('bss_curr',[]) if 'Decrease' in str(r.get('flag','')))
+def render_market_band_carrier_change_table():
+    rows = results.get('market_band_carrier_change', [])
+    html = '<div class="tbl-wrap"><table><thead><tr>'
+    html += f'<th>Market</th><th>BandGrp</th><th>{h1} (Prev)</th><th>{h0} (Curr)</th><th>Pct Diff</th><th>Flag</th>'
+    html += '</tr></thead><tbody>'
+    for r in rows:
+        flagged = r.get('flag','') and 'Decrease' in str(r.get('flag',''))
+        hi = ' style="background:rgba(248,113,113,0.05)"' if flagged else ''
+        pc = r.get('pct_diff')
+        pcls = 'text-red' if pc is not None and float(pc) < 0 else ('text-green' if pc is not None and float(pc) > 0 else '')
+        pstr = (("+" if float(pc) > 0 else "") + str(pc) + "%%") if pc is not None else "—"
+        html += f'<tr{hi}><td>{r["market"]}</td><td>{r["bandgrp"]}</td>'
+        html += f'<td class="num">{fmt(r["prev_count"])}</td>'
+        html += f'<td class="num">{fmt(r["curr_count"])}</td>'
+        html += f'<td class="num {pcls}">{pstr}</td>'
+        html += f'<td>{flag_html(r.get("flag"))}</td></tr>'
+    html += '</tbody></table></div>'
+    return html
 
-def bandvend_flags():
-    flagged = [(r['projecteddate'], r['bandgrp'], r['vendor'], r['pct_diff'])
-               for r in results.get('bandvend',[]) if 'Decrease' in str(r.get('flag',''))]
-    # dedupe by bandgrp+vendor
-    seen = set()
-    uniq = []
-    for yr, bg, v, pc in flagged:
-        if (bg, v) not in seen:
-            seen.add((bg, v))
-            uniq.append((bg, v, pc))
-    return uniq
+def render_trgcurr_market_band_table():
+    rows = results.get('trgcurr_market_band', [])
+    html = '<div class="tbl-wrap"><table><thead><tr>'
+    html += f'<th>Market</th><th>BandGrp</th><th>{TRGCURR_UL} Flag</th><th>Carriers</th><th>%% of Market/Band</th>'
+    html += '</tr></thead><tbody>'
+    
+    # Calculate totals per market/band for percentage calculation
+    market_band_totals = {}
+    for r in rows:
+        key = (r['market'], r['bandgrp'])
+        market_band_totals[key] = market_band_totals.get(key, 0) + int(r['carriers'] or 0)
+    
+    for r in rows:
+        key = (r['market'], r['bandgrp'])
+        total = market_band_totals.get(key, 1)
+        pct = round(int(r['carriers'] or 0) / total * 100, 1) if total else 0
+        flagv = str(r.get('trgcurr_flag', 'null'))
+        html += f'<tr><td>{r["market"]}</td><td>{r["bandgrp"]}</td>'
+        html += f'<td style="font-weight:{"600" if flagv=="y" else "normal"};color:{"var(--green)" if flagv=="y" else "inherit"}">{flagv}</td>'
+        html += f'<td class="num {"text-green" if flagv=="y" else ""}">{fmt(r["carriers"])}</td>'
+        html += f'<td class="num text-muted">{pct}%%</td></tr>'
+    html += '</tbody></table></div>'
+    return html
 
 # ─── Build summary insights ────────────────────────────────────────────────
-rehome_drop_html, unexplained_drop_html, gain_html, ndrop, ngain = market_movers_html()
+rehome_drop_html, unexplained_drop_html, gain_html, ndrop, ngain = market_movers_html(results, h0, h1)
+
+# Get unique rehome source markets for counting (already deduplicated in query results)
+unique_rehome_src = {int(x['old_market']) for x in results.get('rehome', []) if x.get('old_market')}
+
 n_unexplained = sum(1 for r in results.get('market', [])
                     if r.get('var_curr_m1') is not None
                     and float(r['var_curr_m1']) <= -10
-                    and int(r['market']) not in {int(x['old_market']) for x in results.get('rehome', [])})
-bvf = bandvend_flags()
+                    and int(r['market']) not in unique_rehome_src)
+bvf = bandvend_flags(results)
 bvf_html = ''.join(f'<li>{bg}/{v}: <span class="text-red">{pc}%%</span> across all proj years</li>' for bg, v, pc in bvf) or '<li>None</li>'
-n_bss_flags = bss_flags_count()
+n_bss_flags = bss_flags_count(results)
 cec_rows = results.get('cec', [])
 bss_delta = next((r.get('delta',0) for r in cec_rows if r.get('cec_curr')=='BSS'), 0)
 notbss_delta = next((r.get('delta',0) for r in cec_rows if r.get('cec_curr')=='NOT BSS'), 0)
+
+# Top band for lost_by_band insight (dynamic, not hardcoded)
+lost_by_band_rows = results.get('lost_by_band', [])
+top_band_total = sum(int(r['lost_carriers']) for r in lost_by_band_rows)
+top_band_row   = lost_by_band_rows[0] if lost_by_band_rows else None
+top_band_name  = top_band_row['bandgrp'] if top_band_row else ''
+top_band_cnt   = int(top_band_row['lost_carriers']) if top_band_row else 0
+top_band_pct   = round(top_band_cnt / top_band_total * 100, 1) if top_band_total else 0
+
+# Market/Band carrier change flags
+n_market_band_flags = market_band_flags_count(results)
+
+# Data quality message
+dq_message = "All key columns 100%% populated — zero nulls." if dq_status=="Clean" else "Issues detected — see A9."
+
+# Lost by band insight text
+lost_by_band_insight = (
+    f'<b>{top_band_pct}%% of the lost carriers are {top_band_name}</b> ({fmt(top_band_cnt)} carriers) — '
+    f'investigate {top_band_name} pipeline/ingestion for {h0}.'
+) if top_band_row else ''
 
 # ─── HTML Template ─────────────────────────────────────────────────────────
 CSS = """
@@ -677,10 +760,10 @@ HTML = f"""<!DOCTYPE html>
 
 <!-- A3 -->
 <div class="section">
-  <div class="section-title">A3 — trgprjd_ul='y' Band/Vendor by Projected Year (2026–2030)
+  <div class="section-title">A3 — {TRGPRJD_UL}='y' Band/Vendor by Projected Year (2026–2030)
     <span class="badge badge-crit">{len(bvf)} Combo(s) Flagged Across All Years</span>
   </div>
-  <div class="section-desc">Carriers with UL target projected flag, {h1} ref → {h0} stage, all projection years.</div>
+  <div class="section-desc">Carriers with UL projected target flag, {h1} ref &#8594; {h0} stage, all projection years (2026–2030).</div>
   {'<div class="insight crit"><b>Consistently flagged across all projection years:</b><ul>' + bvf_html + '</ul></div>' if bvf else '<div class="insight good">No band/vendor combinations flagged across any projection year.</div>'}
   {render_bandvend_table()}
 </div>
@@ -721,26 +804,22 @@ HTML = f"""<!DOCTYPE html>
 <!-- A6b -->
 <div class="section">
   <div class="section-title">A6b — Lost Carriers by BandGrp (Unexplained Markets Only)
-    <span class="badge badge-crit">MMW {round(next((int(r["lost_carriers"])/sum(int(x["lost_carriers"]) for x in results.get("lost_by_band",[]))*100 for r in results.get("lost_by_band",[]) if r["bandgrp"]=="MMW"), 0), 1)}%% of Loss</span>
+    <span class="badge badge-crit">{top_band_name} {top_band_pct}%% of Loss</span>
   </div>
   <div class="section-desc">
     Of the carriers lost in unexplained declining markets, how much came from each band group (based on {h1} ref).
-    Rehome markets (Mkt 43-&gt;42, Mkt 53-&gt;46) excluded.
+    Rehome markets excluded.
   </div>
-  <div class="insight crit">
-    <b>MMW dominates the loss</b> — confirming that unexplained market declines are almost entirely a MMW carrier drop.
-    The small losses in SUB1-5, SUB3, SUB1-13 and MB are likely collateral from markets that have mixed bands but are
-    MMW-heavy. Investigate whether MMW carriers are being excluded or dropped upstream in the Apr {h0} staging pipeline.
-  </div>
+  {lost_by_band_insight}
   {render_lost_by_band_table()}
 </div>
 
 <!-- A7 -->
 <div class="section">
-  <div class="section-title">A7 — trgprjd_ul Flag Distribution by Projected Year ({h0} Stage)
+  <div class="section-title">A7 — {TRGPRJD_UL} Flag Distribution by Projected Year ({h0} Stage)
     <span class="badge badge-ok">Stable</span>
   </div>
-  <div class="section-desc">How trgprjd_ul ('y'/'n') distributes across each projected year in the {h0} staging table.</div>
+  <div class="section-desc">How {TRGPRJD_UL} ('y'/'n') distributes across each projected year in the {h0} staging table.</div>
   {render_trgdist_table()}
 </div>
 
@@ -767,24 +846,41 @@ HTML = f"""<!DOCTYPE html>
   {render_dq_table()}
 </div>
 
+<!-- A10 -->
+<div class="section">
+  <div class="section-title">A10 — Per Market, Per Band Group Carrier Count Change
+    <span class="badge {'badge-crit' if n_market_band_flags > 0 else 'badge-ok'}">{n_market_band_flags} Decrease(s) &gt;5%%</span>
+  </div>
+  <div class="section-desc">Carrier count changes broken down by market and band group, {h1} ref &#8594; {h0} stage. Identifies specific market/band combinations with significant decreases.</div>
+  {render_market_band_carrier_change_table()}
+</div>
+
+<!-- A11 -->
+<div class="section">
+  <div class="section-title">A11 — {TRGCURR_UL} Distribution Per Market, Per Band Group ({h0} Stage)
+    <span class="badge badge-info">Detailed Breakdown</span>
+  </div>
+  <div class="section-desc">Target current flag distribution broken down by market and band group for the {h0} staging table. Shows carrier counts and percentages within each market/band combination.</div>
+  {render_trgcurr_market_band_table()}
+</div>
+
 <div class="divider"></div>
 
 <!-- Executive Summary -->
 <div class="section">
   <div class="section-title">Executive Summary</div>
-  {'<div class="insight crit"><b>Action Required — ' + ', '.join(f"{bg}/{v}" for bg,v,_ in bvf) + ' (trgprjd_ul=y):</b> Ericsson mid-band UL projected-target carriers dropped ~50-58%% across every projection year (2026-2030). This uniform cross-year drop strongly suggests a pipeline/classification issue. Investigate before publishing.</div>' if bvf else ''}
+  {'<div class="insight crit"><b>Action Required — ' + ', '.join(f"{bg}/{v}" for bg,v,_ in bvf) + f' ({TRGPRJD_UL}=y):</b> These band/vendor combinations declined consistently across all projection years (2026–2030). Investigate pipeline/classification before publishing.</div>' if bvf else ''}
   {rehome_summary_box}
   <div class="insight {'crit' if n_unexplained > 0 else 'warn'}">
     <b>{'Action Required' if n_unexplained > 0 else 'Monitor'} — Unexplained Market Declines (&gt;-10%%):</b>
     {n_unexplained} market(s) dropped &gt;10%% with no rehome mapping ({h0} vs {h1}).
-    <b>{round(next((int(r["lost_carriers"])/sum(int(x["lost_carriers"]) for x in results.get("lost_by_band",[]))*100 for r in results.get("lost_by_band",[]) if r["bandgrp"]=="MMW"),0),1)}%% of the lost carriers are MMW</b>
-    ({fmt(next((r["lost_carriers"] for r in results.get("lost_by_band",[]) if r["bandgrp"]=="MMW"), 0))} carriers) —
-    strongly indicates a MMW pipeline/ingestion issue in the {h0} staging run.
-    Net carrier movement overall: {fmt(lost_cnt)} lost, {fmt(new_cnt)} new, net {('+' if net_change>=0 else '') + fmt(net_change)}.
+    {lost_by_band_insight}
+    Net carrier movement: {fmt(lost_cnt)} lost, {fmt(new_cnt)} new, net {('+' if net_change>=0 else '') + fmt(net_change)}.
   </div>
-  {'<div class="insight warn"><b>Monitor — BSS cec_curr:</b> ' + str(n_bss_flags) + ' band/vendor combination(s) flagged (&gt;5%% decrease in BSS carriers).</div>' if n_bss_flags > 0 else ''}
+  {f'<div class="insight warn"><b>Monitor — BSS cec_curr:</b> {n_bss_flags} band/vendor combination(s) flagged (&gt;5%% decrease in BSS carriers).</div>' if n_bss_flags > 0 else ''}
+  {f'<div class="insight crit"><b>Action Required — Market/Band Carrier Changes:</b> {n_market_band_flags} market/band combination(s) flagged (&gt;5%% decrease). See A10 for detailed breakdown.</div>' if n_market_band_flags > 0 else ''}
   <div class="insight good">
-    <b>Data Quality:</b> {'All key columns 100%% populated — zero nulls.' if dq_status=='Clean' else 'Issues detected — see A9.'}
+    <b>Data Quality:</b> {dq_message}
     cec_prjd is expected to be null for UL tables.
   </div>
 </div>

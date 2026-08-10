@@ -67,13 +67,13 @@ QUERIES = {
 "avail": (f"""
 SELECT '{STAGE}' AS tbl, cptmonth::date AS cptmonth,
        COUNT(*) AS rows, COUNT(DISTINCT agg_unique_id) AS carriers
-FROM {STAGE} WHERE cptmonth >= %s GROUP BY cptmonth
+FROM {STAGE} WHERE cptmonth = %s GROUP BY cptmonth
 UNION ALL
 SELECT '{REF}', cptmonth::date,
        COUNT(*), COUNT(DISTINCT agg_unique_id)
-FROM {REF} WHERE cptmonth >= %s GROUP BY cptmonth
+FROM {REF} WHERE cptmonth IN (%s, %s) GROUP BY cptmonth
 ORDER BY 1, 2
-""", (M2, M2)),
+""", (CURR, M1, M2)),
 
 "market": (f"""
 WITH m0 AS (SELECT market, COUNT(*) AS cnt FROM {STAGE} WHERE cptmonth=%s GROUP BY 1),
@@ -266,8 +266,10 @@ if DATA_MODE == 'csv':
     csv_files = load_csv_data(DATA_DIR)
     detected_curr, detected_m1, detected_m2 = detect_csv_dates(csv_files, STAGE, REF)
     
-    # Update global date variables if dates were detected
-    if detected_curr:
+    # Only use detected dates if no specific snapshot date was provided
+    # If user provided a specific date, try to use that instead
+    if len(sys.argv) <= 1 and detected_curr:
+        # No command-line date provided, use detected dates from CSV
         CURR = detected_curr
         M1 = detected_m1 if detected_m1 else M1
         M2 = detected_m2 if detected_m2 else M2
@@ -282,6 +284,13 @@ if DATA_MODE == 'csv':
         # Update output filename
         out_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              f"vpi_dl_report_{curr_dt.strftime('%b_%Y')}.html")
+        print(f"Using detected dates from CSV files: {CURR} (current), {M1} (M-1), {M2} (M-2)")
+    else:
+        # User provided specific date or detection failed, use that date
+        # but warn if CSV files don't contain the requested date
+        if detected_curr and detected_curr != CURR:
+            print(f"Warning: CSV files contain {detected_curr}, but analyzing {CURR} as requested")
+        print(f"Using requested date: {CURR} (current), {M1} (M-1), {M2} (M-2)")
     
     print()
     
